@@ -1,0 +1,142 @@
+package protobuf;
+
+fn packable(kind: Kind) -> bool {
+    match kind {
+        String | Bytes | Message(_) => false,
+        _ => true,
+    }
+}
+
+fn repeated(rule: Rule) -> bool {
+    rule == Rule::Repeated || rule == Rule::Packed
+}
+
+fn kind_wire(kind: Kind) -> WireType {
+    match kind {
+        Double | Fixed64 | Sfixed64 => WireType::Fixed64,
+        Float | Fixed32 | Sfixed32 => WireType::Fixed32,
+        String | Bytes | Message(_) => WireType::Bytes,
+        _ => WireType::Varint,
+    }
+}
+
+impl Schema {
+    pub fn new(messages: Vec[MessageSpec], root: isize, limits: Limits) -> Result[Schema, Error] {
+        limits.validate()?;
+        if root < 0 || root >= messages.len() {
+            return Result::Err(
+                failure(ErrorKind::Schema, 0, "schema root is outside message definitions"),
+            )
+        }
+        if messages.len() > limits.max_schema_fields {
+            return Result::Err(failure(ErrorKind::Limit, 0, "schema definition limit exceeded"))
+        }
+        let definitions = Vec::new();
+        let mut count = 0;
+        for message in messages {
+            if message.fields.len() > limits.max_schema_fields - count {
+                return Result::Err(failure(ErrorKind::Limit, 0, "schema field limit exceeded"))
+            }
+            count += message.fields.len();
+            let fields = message.fields.copy();
+            fields.sort_by(
+                |a, b| if a.number < b.number {
+                    -1
+                } else if a.number > b.number {
+                    1
+                } else {
+                    0
+                },
+            );
+            let mut previous: u32 = 0;
+            for field in fields {
+                valid_number(field.number, 0)?;
+                if field.number == previous || (field.number >= 19000 && field.number <= 19999) {
+                    return Result::Err(
+                        failure(ErrorKind::Schema, 0, "duplicate or reserved schema field number"),
+                    )
+                }
+                previous = field.number;
+                if field.rule == Rule::Packed && !packable(field.kind) {
+                    return Result::Err(
+                        failure(ErrorKind::Schema, 0, "only numeric repeated fields can be packed"),
+                    )
+                }
+                if let Kind::Message(id) = field.kind {
+                    if id < 0 || id >= messages.len() {
+                        return Result::Err(
+                            failure(ErrorKind::Schema, 0, "invalid nested message definition"),
+                        )
+                    }
+                    if field.rule == Rule::Implicit {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Schema,
+                                0,
+                                "message fields require explicit presence",
+                            ),
+                        )
+                    }
+                }
+            }
+            definitions.push(Definition { fields: fields.freeze() });
+        }
+        Result::Ok(Schema { definitions: definitions.freeze(), root })
+    }
+}
+
+fn specification(schema: Schema, message: isize, number: u32) -> Option[FieldSpec] {
+    let fields = schema.definitions.get(message).fields;
+    let mut low = 0;
+    let mut high = fields.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let field = fields.get(middle);
+        if field.number == number {
+            return Option::Some(field)
+        }
+        if field.number < number {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    Option::None
+}
+
+fn default_value(value: Value) -> bool {
+    match value {
+        I32(v) => v == 0,
+        I64(v) => v == 0,
+        U32(v) => v == 0,
+        U64(v) => v == 0,
+        F32(v) => v.to_bits() == 0,
+        F64(v) => v.to_bits() == 0,
+        Bool(v) => !v,
+        String(v) => v == "",
+        Bytes(v) => v.is_empty(),
+        Message(_) => false,
+    }
+}
+
+fn value_matches(kind: Kind, value: Value) -> bool {
+    match (kind, value) {
+        (Kind::Int32, Value::I32(_)) | (Kind::Sint32, Value::I32(_)) | (
+            Kind::Sfixed32,
+            Value::I32(_),
+        ) | (Kind::Enum, Value::I32(_)) | (Kind::Int64, Value::I64(_)) | (
+            Kind::Sint64,
+            Value::I64(_),
+        ) | (Kind::Sfixed64, Value::I64(_)) | (Kind::Uint32, Value::U32(_)) | (
+            Kind::Fixed32,
+            Value::U32(_),
+        ) | (Kind::Uint64, Value::U64(_)) | (Kind::Fixed64, Value::U64(_)) | (
+            Kind::Float,
+            Value::F32(_),
+        ) | (Kind::Double, Value::F64(_)) | (Kind::Bool, Value::Bool(_)) | (
+            Kind::String,
+            Value::String(_),
+        ) | (Kind::Bytes, Value::Bytes(_)) | (Kind::Message(_), Value::Message(_)) => true,
+        _ => false,
+    }
+}

@@ -1,0 +1,197 @@
+package protobuf;
+
+use std::utf8;
+
+fn scalar_value(kind: Kind, numeric: u64, input: Slice[u8], start: isize, end: isize, base: isize) -> Result[
+    Value,
+    Error,
+] {
+    Result::Ok(
+        match kind {
+            Int32 | Enum => Value::I32(numeric.to_i32()),
+            Int64 => Value::I64(numeric.to_i64()),
+            Uint32 | Fixed32 => Value::U32(numeric.to_u32()),
+            Uint64 | Fixed64 => Value::U64(numeric),
+            Sint32 => Value::I32(unzigzag32(numeric.to_u32())),
+            Sint64 => Value::I64(unzigzag64(numeric)),
+            Sfixed32 => Value::I32(numeric.to_i32()),
+            Sfixed64 => Value::I64(numeric.to_i64()),
+            Bool => Value::Bool(numeric != 0),
+            Float => Value::F32(float32_from_bits(numeric.to_u32())),
+            Double => Value::F64(float64_from_bits(numeric)),
+            Bytes => Value::Bytes(input.sub(start, end).to_vec()),
+            String => {
+                utf8::validate(input.sub(start, end)).map_err(
+                    |_| failure(
+                        ErrorKind::InvalidUtf8,
+                        base + start,
+                        "string field is not valid UTF-8",
+                    ),
+                )?;
+                let (_, value) = string_from_utf8(input.sub(start, end).to_vec());
+                Value::String(value)
+            },
+            Message(_) => return Result::Err(
+                failure(
+                    ErrorKind::TypeMismatch,
+                    base + start,
+                    "message requires recursive decoding",
+                ),
+            ),
+        },
+    )
+}
+
+fn packed_values(
+    target: Message,
+    field: FieldSpec,
+    input: Slice[u8],
+    base: isize,
+    options: Options,
+    counts: Budget,
+) -> Result[(), Error] {
+    let mut at = 0;
+    while at < input.len() {
+        charge(counts.values, options.limits.max_values, base + at, "value limit exceeded")?;
+        let (value, end) = match kind_wire(field.kind) {
+            Varint => varint_at(input, at, base, options.canonical_varints)?,
+            Fixed32 => fixed_at(input, at, 4, base)?,
+            Fixed64 => fixed_at(input, at, 8, base)?,
+            _ => return Result::Err(
+                failure(ErrorKind::Schema, base + at, "non-numeric packed field"),
+            ),
+        };
+        target.add(field.number, scalar_value(field.kind, value, input, at, end, base)?);
+        at = end;
+    }
+    Result::Ok(())
+}
+
+fn decode_into(
+    schema: Schema,
+    definition: isize,
+    target: Message,
+    input: Slice[u8],
+    base: isize,
+    options: Options,
+    depth: isize,
+    counts: Budget,
+) -> Result[(), Error] {
+    depth_check(depth, options.limits, base)?;
+    let mut at = 0;
+    while at < input.len() {
+        let parsed = scan(input, at, base, options, depth, counts, false)?;
+        let matched = match specification(schema, definition, parsed.number) {
+            Some(field) => if parsed.wire == kind_wire(field.kind)
+                || (repeated(field.rule) && packable(field.kind) && parsed.wire == WireType::Bytes) {
+                Option::Some(field)
+            } else {
+                Option::None
+            },
+            None => Option::None,
+        };
+        match matched {
+            None => {
+                charge(counts.values, options.limits.max_values, base + at, "value limit exceeded")?;
+                if !options.discard_unknown {
+                    target.add_unknown(raw_field(input, at, parsed));
+                }
+            },
+            Some(field) => {
+                if repeated(field.rule) && packable(field.kind) && parsed.wire == WireType::Bytes {
+                    packed_values(
+                        target,
+                        field,
+                        input.sub(parsed.payload_start, parsed.payload_end),
+                        base + parsed.payload_start,
+                        options,
+                        counts,
+                    )?;
+                } else {
+                    charge(
+                        counts.values,
+                        options.limits.max_values,
+                        base + at,
+                        "value limit exceeded",
+                    )?;
+                    let value = match field.kind {
+                        Kind::Message(id) => {
+                            let child = if repeated(field.rule) {
+                                Message::new()
+                            } else {
+                                match target.get(field.number) {
+                                    Some(Value::Message(existing)) => existing,
+                                    _ => Message::new(),
+                                }
+                            };
+                            decode_into(
+                                schema,
+                                id,
+                                child,
+                                input.sub(parsed.payload_start, parsed.payload_end),
+                                base + parsed.payload_start,
+                                options,
+                                depth + 1,
+                                counts,
+                            )?;
+                            Value::Message(child)
+                        },
+                        _ => scalar_value(
+                            field.kind,
+                            parsed.numeric,
+                            input,
+                            parsed.payload_start,
+                            parsed.payload_end,
+                            base,
+                        )?,
+                    };
+                    if repeated(field.rule) {
+                        target.add(field.number, value);
+                    } else if field.rule == Rule::Implicit && default_value(value) {
+                        target.clear(field.number);
+                    } else {
+                        target.set(field.number, value);
+                    }
+                }
+            },
+        }
+        at = parsed.end;
+    }
+    Result::Ok(())
+}
+
+fn required_fields(schema: Schema, definition: isize, target: Message, depth: isize, limits: Limits) -> Result[
+    (),
+    Error,
+] {
+    depth_check(depth, limits, 0)?;
+    for field in schema.definitions.get(definition).fields.iter() {
+        if field.rule == Rule::Required && !target.has(field.number) {
+            return Result::Err(
+                failure(
+                    ErrorKind::MissingRequired,
+                    0,
+                    "missing required field " + field.number.to_string(),
+                ),
+            )
+        }
+        if let Kind::Message(id) = field.kind {
+            for value in target.get_all(field.number) {
+                if let Value::Message(child) = value {
+                    required_fields(schema, id, child, depth + 1, limits)?;
+                }
+            }
+        }
+    }
+    Result::Ok(())
+}
+
+impl Schema {
+    pub fn decode(self: Schema, input: Slice[u8], options: Options) -> Result[Message, Error] {
+        check_input(input, options.limits)?;
+        let message = Message::new();
+        decode_into(self, self.root, message, input, 0, options, 0, budget())?;
+        required_fields(self, self.root, message, 0, options.limits)?;
+        Result::Ok(message)
+    }
+}

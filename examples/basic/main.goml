@@ -1,0 +1,374 @@
+package main;
+
+use ecosystem::protobuf as pb;
+use std::json;
+use std::num;
+use std::io;
+use std::env;
+use std::process;
+
+pub fn unhex(value: string) -> Result[Vec[u8], string] {
+    if value.byte_len() % 2 != 0 {
+        return Result::Err("odd hex length")
+    }
+    let output = Vec::with_capacity(value.byte_len() / 2);
+    let mut at = 0;
+    while at < value.byte_len() {
+        let mut byte: u8 = 0;
+        for index in at..at + 2 {
+            let digit = value.byte_get(index);
+            let nibble = if digit >= 48 && digit <= 57 {
+                digit - 48
+            } else if digit >= 97 && digit <= 102 {
+                digit - 87
+            } else {
+                return Result::Err("invalid hex")
+            };
+            byte = byte * 16 + nibble;
+        }
+        output.push(byte);
+        at += 2;
+    }
+    Result::Ok(output)
+}
+
+pub fn hex(value: Vec[u8]) -> string {
+    let output = Vec::with_capacity(value.len() * 2);
+    let digits = "0123456789abcdef";
+    for byte in value {
+        output.push(digits.byte_get((byte / 16).to_isize()));
+        output.push(digits.byte_get((byte % 16).to_isize()));
+    }
+    string_from_utf8(output).1
+}
+
+pub fn sample_schema(proto2: bool, packed: bool, explicit: bool) -> Result[pb::Schema, pb::Error] {
+    let kinds = Vec::from_array(
+        [
+            pb::Kind::Double,
+            pb::Kind::Float,
+            pb::Kind::Int64,
+            pb::Kind::Uint64,
+            pb::Kind::Int32,
+            pb::Kind::Fixed64,
+            pb::Kind::Fixed32,
+            pb::Kind::Bool,
+            pb::Kind::String,
+            pb::Kind::Bytes,
+            pb::Kind::Uint32,
+            pb::Kind::Enum,
+            pb::Kind::Sfixed32,
+            pb::Kind::Sfixed64,
+            pb::Kind::Sint32,
+            pb::Kind::Sint64,
+        ],
+    );
+    let fields = Vec::new();
+    for index in 0..kinds.len() {
+        let kind = kinds[index];
+        fields.push(
+            pb::FieldSpec {
+                number: (index + 1).to_u32(),
+                kind,
+                rule: if proto2 || explicit {
+                    pb::Rule::Optional
+                } else {
+                    pb::Rule::Implicit
+                },
+            },
+        );
+        fields.push(
+            pb::FieldSpec {
+                number: (index + 21).to_u32(),
+                kind,
+                rule: if packed && index != 8 && index != 9 {
+                    pb::Rule::Packed
+                } else {
+                    pb::Rule::Repeated
+                },
+            },
+        );
+    }
+    fields.push(pb::FieldSpec { number: 17, kind: pb::Kind::Message(1), rule: pb::Rule::Optional });
+    fields.push(pb::FieldSpec { number: 18, kind: pb::Kind::Message(1), rule: pb::Rule::Repeated });
+    fields.push(pb::FieldSpec { number: 41, kind: pb::Kind::Message(0), rule: pb::Rule::Optional });
+    let child = pb::MessageSpec {
+        fields: Vec::from_array(
+            [
+                pb::FieldSpec {
+                    number: 1,
+                    kind: pb::Kind::Int32,
+                    rule: if proto2 {
+                        pb::Rule::Required
+                    } else {
+                        pb::Rule::Implicit
+                    },
+                },
+                pb::FieldSpec {
+                    number: 2,
+                    kind: pb::Kind::String,
+                    rule: if proto2 || explicit {
+                        pb::Rule::Optional
+                    } else {
+                        pb::Rule::Implicit
+                    },
+                },
+                pb::FieldSpec { number: 3, kind: pb::Kind::Int32, rule: pb::Rule::Packed },
+            ],
+        ),
+    };
+    pb::Schema::new(Vec::from_array([pb::MessageSpec { fields }, child]), 0, pb::Limits::standard())
+}
+
+fn member(value: json::Value, key: string) -> json::Value {
+    json::field(value, key).unwrap_or(json::Value::Null)
+}
+
+fn text(value: json::Value, key: string) -> string {
+    json::as_string(member(value, key)).unwrap_or("")
+}
+
+fn flag(value: json::Value, key: string) -> bool {
+    json::as_bool(member(value, key)).unwrap_or(false)
+}
+
+fn array(value: json::Value) -> Vec[json::Value] {
+    json::as_array(value).unwrap_or(Vec::new())
+}
+
+fn js(value: string) -> json::Value {
+    json::Value::String(value)
+}
+
+fn object(values: Vec[(string, json::Value)]) -> json::Value {
+    json::Value::Object(values)
+}
+
+fn unsigned(value: string) -> Result[u64, string] {
+    num::parse_uint_bits(value, 10, 64).map_err(|e| e.to_string())
+}
+
+fn signed(value: string) -> Result[i64, string] {
+    num::parse_int_bits(value, 10, 64).map_err(|e| e.to_string())
+}
+
+fn input_value(value: json::Value) -> Result[pb::Value, string] {
+    let source = text(value, "s");
+    Result::Ok(
+        match text(value, "k") {
+            "i32" => pb::Value::I32(
+                num::parse_int_bits(source, 10, 32).map_err(|e| e.to_string())?.to_i32(),
+            ),
+            "i64" => pb::Value::I64(signed(source)?),
+            "u32" => pb::Value::U32(
+                num::parse_uint_bits(source, 10, 32).map_err(|e| e.to_string())?.to_u32(),
+            ),
+            "u64" => pb::Value::U64(unsigned(source)?),
+            "f32" => pb::Value::F32(float32_from_bits(unsigned(source)?.to_u32())),
+            "f64" => pb::Value::F64(float64_from_bits(unsigned(source)?)),
+            "bool" => pb::Value::Bool(source == "true"),
+            "string" => pb::Value::String(source),
+            "bytes" => pb::Value::Bytes(unhex(source)?),
+            "message" => pb::Value::Message(input_message(member(value, "message"))?),
+            _ => return Result::Err("unknown input value kind"),
+        },
+    )
+}
+
+fn input_message(value: json::Value) -> Result[pb::Message, string] {
+    let message = pb::Message::new();
+    for entry in array(member(value, "fields")) {
+        let number = json::as_int(member(entry, "n")).ok_or("missing field number")?;
+        if number < 1 || number > 536870911 {
+            return Result::Err("invalid field number")
+        }
+        for value in array(member(entry, "v")) {
+            message.add(number.to_u32(), input_value(value)?);
+        }
+    }
+    for value in array(member(value, "unknown")) {
+        let data = unhex(json::as_string(value).ok_or("invalid raw field")?)?;
+        for field in pb::parse_fields(data.as_slice(), pb::Options::standard()).map_err(
+            |e| e.to_string(),
+        )? {
+            message.add_unknown(field);
+        }
+    }
+    Result::Ok(message)
+}
+
+fn describe_value(value: pb::Value) -> json::Value {
+    let (kind, source) = match value {
+        I32(v) => ("i32", v.to_string()),
+        I64(v) => ("i64", v.to_string()),
+        U32(v) => ("u32", v.to_string()),
+        U64(v) => ("u64", v.to_string()),
+        F32(v) => (
+            "f32",
+            if v != v {
+                "nan"
+            } else {
+                v.to_bits().to_string()
+            },
+        ),
+        F64(v) => (
+            "f64",
+            if v != v {
+                "nan"
+            } else {
+                v.to_bits().to_string()
+            },
+        ),
+        Bool(v) => ("bool", v.to_string()),
+        String(v) => ("string", v),
+        Bytes(v) => ("bytes", hex(v)),
+        Message(v) => return object(
+            Vec::from_array([("k", js("message")), ("message", describe_message(v))]),
+        ),
+    };
+    if source == "" {
+        object(Vec::from_array([("k", js(kind))]))
+    } else {
+        object(Vec::from_array([("k", js(kind)), ("s", js(source))]))
+    }
+}
+
+fn describe_message(message: pb::Message) -> json::Value {
+    let fields = Vec::new();
+    for number in 1..42 {
+        let values = message.get_all(number.to_u32());
+        if !values.is_empty() {
+            let rendered = Vec::new();
+            for value in values {
+                rendered.push(describe_value(value));
+            }
+            fields.push(
+                object(
+                    Vec::from_array(
+                        [
+                            ("n", json::Value::Number(number.to_string())),
+                            ("v", json::Value::Array(rendered)),
+                        ],
+                    ),
+                ),
+            );
+        }
+    }
+    let unknown = Vec::new();
+    for field in message.unknown_fields() {
+        unknown.push(js(hex(field.encoded())));
+    }
+    object(
+        Vec::from_array(
+            [("fields", json::Value::Array(fields)), ("unknown", json::Value::Array(unknown))],
+        ),
+    )
+}
+
+pub fn handle(request: json::Value) -> Result[json::Value, string] {
+    let input = unhex(text(request, "hex"))?;
+    let options = pb::Options {
+        canonical_varints: flag(request, "canonical"),
+        discard_unknown: flag(request, "discard"),
+        ..pb::Options::standard(),
+    };
+    if text(request, "op") == "wire" {
+        let fields = pb::parse_fields(input.as_slice(), options).map_err(|e| e.to_string())?;
+        let raw = Vec::new();
+        for field in fields {
+            raw.push(js(hex(field.encoded())));
+        }
+        return Result::Ok(
+            object(
+                Vec::from_array(
+                    [
+                        ("raw", json::Value::Array(raw)),
+                        (
+                            "hex",
+                            js(
+                                hex(
+                                    pb::encode_fields(fields.as_slice(), options.limits).map_err(
+                                        |e| e.to_string(),
+                                    )?,
+                                ),
+                            ),
+                        ),
+                    ],
+                ),
+            ),
+        )
+    }
+    let schema = sample_schema(
+        flag(request, "proto2"),
+        flag(request, "packed"),
+        flag(request, "explicit"),
+    ).map_err(|e| e.to_string())?;
+    let message = if text(request, "op") == "encode" {
+        input_message(member(request, "message"))?
+    } else {
+        schema.decode(input.as_slice(), options).map_err(|e| e.to_string())?
+    };
+    let encoded = schema.encode(message, options.limits).map_err(|e| e.to_string())?;
+    let normalized = schema.decode(encoded.as_slice(), options).map_err(|e| e.to_string())?;
+    Result::Ok(
+        object(
+            Vec::from_array(
+                [
+                    ("hex", js(hex(encoded))),
+                    ("message", describe_message(normalized)),
+                    ("decoded", describe_message(message)),
+                ],
+            ),
+        ),
+    )
+}
+
+pub fn exercise() -> Result[(), string] {
+    let schema = sample_schema(false, true, false).map_err(|e| e.to_string())?;
+    let message = pb::Message::new();
+    message.set(9, pb::Value::String("GoML protobuf"));
+    message.add(25, pb::Value::I32(-1));
+    message.add(25, pb::Value::I32(150));
+    let child = pb::Message::new();
+    child.set(1, pb::Value::I32(7));
+    message.set(17, pb::Value::Message(child));
+    message.add_unknown(
+        pb::field(100, pb::WireValue::Varint(99), pb::Limits::standard()).map_err(|e| e.to_string())?,
+    );
+    let encoded = schema.encode(message, pb::Limits::standard()).map_err(|e| e.to_string())?;
+    let decoded = schema.decode(encoded.as_slice(), pb::Options::standard()).map_err(
+        |e| e.to_string(),
+    )?;
+    if decoded.get_all(25).len() != 2 || decoded.unknown_fields().len() != 1 {
+        return Result::Err("consumer roundtrip mismatch")
+    }
+    Result::Ok(())
+}
+
+fn run() -> Result[(), string] {
+    if env::args().len() == 1 {
+        exercise()?;
+        println("protobuf consumer: ok");
+        return Result::Ok(())
+    }
+    let input = io::read_stdin_to_string().map_err(|e| e.to_string())?;
+    let requests = json::as_array(json::parse(input)?).ok_or("expected request array")?;
+    let responses = Vec::new();
+    for request in requests {
+        responses.push(
+            match handle(request) {
+                Ok(value) => value,
+                Err(error) => object(Vec::from_array([("error", js(error))])),
+            },
+        );
+    }
+    println(json::encode(json::Value::Array(responses)));
+    Result::Ok(())
+}
+
+fn main() -> () {
+    if let Err(error) = run() {
+        io::eprintln(error);
+        process::exit(1);
+    }
+}

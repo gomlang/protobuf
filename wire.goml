@@ -1,0 +1,284 @@
+package protobuf;
+
+struct Parsed {
+    number: u32,
+    wire: WireType,
+    numeric: u64,
+    payload_start: isize,
+    payload_end: isize,
+    end: isize,
+}
+
+fn scan(
+    input: Slice[u8],
+    start: isize,
+    base: isize,
+    options: Options,
+    depth: isize,
+    counts: Budget,
+    allow_end: bool,
+) -> Result[Parsed, Error] {
+    charge(counts.fields, options.limits.max_fields, base + start, "field limit exceeded")?;
+    let (tag, head) = varint_at(input, start, base, options.canonical_varints)?;
+    if tag >> 3 > 536870911 {
+        return Result::Err(
+            failure(ErrorKind::InvalidField, base + start, "field number exceeds 29 bits"),
+        )
+    }
+    let number = (tag >> 3).to_u32();
+    valid_number(number, base + start)?;
+    let (wire, numeric, payload_start, payload_end, end) = match tag & 7 {
+        0 => {
+            let (value, end) = varint_at(input, head, base, options.canonical_varints)?;
+            (WireType::Varint, value, head, end, end)
+        },
+        1 => {
+            let (value, end) = fixed_at(input, head, 8, base)?;
+            (WireType::Fixed64, value, head, end, end)
+        },
+        2 => {
+            let (length, payload) = varint_at(input, head, base, options.canonical_varints)?;
+            if length > 2147483647 || length > options.limits.max_blob.to_u64() {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Limit,
+                        base + head,
+                        "length-delimited value exceeds byte limit",
+                    ),
+                )
+            }
+            if length > (input.len() - payload).to_u64() {
+                return Result::Err(
+                    failure(
+                        ErrorKind::UnexpectedEof,
+                        base + input.len(),
+                        "truncated length-delimited value",
+                    ),
+                )
+            }
+            let end = payload + length.to_isize();
+            (WireType::Bytes, 0, payload, end, end)
+        },
+        3 => {
+            depth_check(depth + 1, options.limits, base + start)?;
+            let mut at = head;
+            loop {
+                if at == input.len() {
+                    return Result::Err(
+                        failure(ErrorKind::UnexpectedEof, base + at, "unterminated group"),
+                    )
+                }
+                let child = scan(input, at, base, options, depth + 1, counts, true)?;
+                if child.wire == WireType::EndGroup {
+                    if child.number != number {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::GroupMismatch,
+                                base + at,
+                                "group end field number does not match",
+                            ),
+                        )
+                    }
+                    break(WireType::StartGroup, 0, head, at, child.end);
+                }
+                at = child.end;
+            }
+        },
+        4 => {
+            if !allow_end {
+                return Result::Err(
+                    failure(ErrorKind::GroupMismatch, base + start, "unexpected end-group tag"),
+                )
+            };
+            (WireType::EndGroup, 0, head, head, head)
+        },
+        5 => {
+            let (value, end) = fixed_at(input, head, 4, base)?;
+            (WireType::Fixed32, value, head, end, end)
+        },
+        _ => return Result::Err(failure(ErrorKind::InvalidWire, base + start, "reserved wire type")),
+    };
+    Result::Ok(Parsed { number, wire, numeric, payload_start, payload_end, end })
+}
+
+fn raw_field(input: Slice[u8], start: isize, parsed: Parsed) -> RawField {
+    RawField {
+        number: parsed.number,
+        wire: parsed.wire,
+        raw: input.sub(start, parsed.end).to_vec(),
+        payload_start: parsed.payload_start - start,
+        payload_end: parsed.payload_end - start,
+        numeric: parsed.numeric,
+    }
+}
+
+fn check_input(input: Slice[u8], limits: Limits) -> Result[(), Error] {
+    limits.validate()?;
+    if input.len() > limits.max_input || input.len() > 2147483647 {
+        Result::Err(failure(ErrorKind::Limit, 0, "message input exceeds byte limit"))
+    } else {
+        Result::Ok(())
+    }
+}
+
+pub fn parse_fields(input: Slice[u8], options: Options) -> Result[Vec[RawField], Error] {
+    check_input(input, options.limits)?;
+    let counts = budget();
+    let output = Vec::new();
+    let mut at = 0;
+    while at < input.len() {
+        let parsed = scan(input, at, 0, options, 0, counts, false)?;
+        charge(counts.values, options.limits.max_values, at, "value limit exceeded")?;
+        output.push(raw_field(input, at, parsed));
+        at = parsed.end;
+    }
+    Result::Ok(output)
+}
+
+pub fn skip_field(input: Slice[u8], options: Options) -> Result[isize, Error] {
+    check_input(input, options.limits)?;
+    Result::Ok(scan(input, 0, 0, options, 0, budget(), false)?.end)
+}
+
+fn output_size(total: isize, added: isize, limits: Limits) -> Result[isize, Error] {
+    if added > limits.max_output - total || added > 2147483647 - total {
+        Result::Err(failure(ErrorKind::Limit, 0, "encoded output exceeds byte limit"))
+    } else {
+        Result::Ok(total + added)
+    }
+}
+
+fn check_blob(length: isize, limits: Limits) -> Result[(), Error] {
+    if length > limits.max_blob || length > 2147483647 {
+        Result::Err(failure(ErrorKind::Limit, 0, "length-delimited value exceeds byte limit"))
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn raw_size(field: RawField, limits: Limits, depth: isize, counts: Budget) -> Result[isize, Error] {
+    let data = field.raw.as_slice();
+    let options = Options { limits, canonical_varints: false, discard_unknown: false };
+    let _ = scan(data, 0, 0, options, depth, counts, false)?;
+    charge(counts.values, limits.max_values, 0, "value limit exceeded")?;
+    Result::Ok(data.len())
+}
+
+pub fn encode_fields(fields: Slice[RawField], limits: Limits) -> Result[Vec[u8], Error] {
+    limits.validate()?;
+    let counts = budget();
+    let mut size = 0;
+    for field in fields {
+        size = output_size(size, raw_size(field, limits, 0, counts)?, limits)?;
+    }
+    let output = Vec::with_capacity(size);
+    for field in fields {
+        output.extend(field.raw);
+    }
+    Result::Ok(output)
+}
+
+pub fn field(number: u32, value: WireValue, limits: Limits) -> Result[RawField, Error] {
+    limits.validate()?;
+    valid_number(number, 0)?;
+    let counts = budget();
+    charge(counts.fields, limits.max_fields, 0, "field limit exceeded")?;
+    charge(counts.values, limits.max_values, 0, "value limit exceeded")?;
+    let (wire, size) = match value {
+        Varint(value) => (WireType::Varint, varint_size(value)),
+        Fixed32(_) => (WireType::Fixed32, 4),
+        Fixed64(_) => (WireType::Fixed64, 8),
+        Bytes(bytes) => {
+            check_blob(bytes.len(), limits)?;
+            (WireType::Bytes, output_size(varint_size(bytes.len().to_u64()), bytes.len(), limits)?)
+        },
+        Group(children) => {
+            depth_check(1, limits, 0)?;
+            let mut size = varint_size((number.to_u64() << 3) | 4);
+            for child in children {
+                let _ = scan(
+                    child.raw.as_slice(),
+                    0,
+                    0,
+                    Options { limits, canonical_varints: false, discard_unknown: false },
+                    1,
+                    counts,
+                    false,
+                )?;
+                size = output_size(size, child.raw.len(), limits)?;
+            }
+            charge(counts.fields, limits.max_fields, 0, "field limit exceeded")?;
+            (WireType::StartGroup, size)
+        },
+    };
+    let tag = (number.to_u64() << 3) | wire_code(wire);
+    let size = output_size(varint_size(tag), size, limits)?;
+    let output = Vec::with_capacity(size);
+    put_varint(output, tag);
+    match value {
+        Varint(value) => put_varint(output, value),
+        Fixed32(value) => put_fixed(output, value.to_u64(), 4),
+        Fixed64(value) => put_fixed(output, value, 8),
+        Bytes(value) => {
+            put_varint(output, value.len().to_u64());
+            output.extend(value);
+        },
+        Group(children) => {
+            for child in children {
+                output.extend(child.raw);
+            }
+            put_varint(output, (number.to_u64() << 3) | 4);
+        },
+    }
+    let parsed = scan(
+        output.as_slice(),
+        0,
+        0,
+        Options { limits, canonical_varints: false, discard_unknown: false },
+        0,
+        budget(),
+        false,
+    )?;
+    if limits.max_values < 1 {
+        return Result::Err(failure(ErrorKind::Limit, 0, "value limit exceeded"))
+    }
+    Result::Ok(
+        RawField {
+            number,
+            wire,
+            raw: output,
+            payload_start: parsed.payload_start,
+            payload_end: parsed.payload_end,
+            numeric: parsed.numeric,
+        },
+    )
+}
+
+pub fn consume_bytes(input: Slice[u8], options: Options) -> Result[(Vec[u8], isize), Error] {
+    check_input(input, options.limits)?;
+    let (length, start) = varint_at(input, 0, 0, options.canonical_varints)?;
+    if length > 2147483647 || length > options.limits.max_blob.to_u64() {
+        return Result::Err(
+            failure(ErrorKind::Limit, 0, "length-delimited value exceeds byte limit"),
+        )
+    }
+    if length > (input.len() - start).to_u64() {
+        return Result::Err(
+            failure(ErrorKind::UnexpectedEof, input.len(), "truncated length-delimited value"),
+        )
+    }
+    let end = start + length.to_isize();
+    Result::Ok((input.sub(start, end).to_vec(), end))
+}
+
+pub fn encode_bytes(value: Slice[u8], limits: Limits) -> Result[Vec[u8], Error] {
+    limits.validate()?;
+    check_blob(value.len(), limits)?;
+    let size = output_size(varint_size(value.len().to_u64()), value.len(), limits)?;
+    let output = Vec::with_capacity(size);
+    put_varint(output, value.len().to_u64());
+    for byte in value {
+        output.push(byte);
+    }
+    Result::Ok(output)
+}

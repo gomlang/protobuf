@@ -1,0 +1,225 @@
+package protobuf;
+
+fn numeric_value(kind: Kind, value: Value) -> u64 {
+    match value {
+        I32(v) => if kind == Kind::Sint32 {
+            zigzag32(v).to_u64()
+        } else if kind == Kind::Sfixed32 {
+            v.to_u32().to_u64()
+        } else {
+            v.to_i64().to_u64()
+        },
+        I64(v) => if kind == Kind::Sint64 {
+            zigzag64(v)
+        } else {
+            v.to_u64()
+        },
+        U32(v) => v.to_u64(),
+        U64(v) => v,
+        F32(v) => v.to_bits().to_u64(),
+        F64(v) => v.to_bits(),
+        Bool(v) => if v {
+            1
+        } else {
+            0
+        },
+        _ => 0,
+    }
+}
+
+fn scalar_size(kind: Kind, value: Value, limits: Limits) -> Result[isize, Error] {
+    match value {
+        String(text) => {
+            check_blob(text.byte_len(), limits)?;
+            output_size(varint_size(text.byte_len().to_u64()), text.byte_len(), limits)
+        },
+        Bytes(bytes) => {
+            check_blob(bytes.len(), limits)?;
+            output_size(varint_size(bytes.len().to_u64()), bytes.len(), limits)
+        },
+        _ => Result::Ok(
+            match kind_wire(kind) {
+                Fixed32 => 4,
+                Fixed64 => 8,
+                _ => varint_size(numeric_value(kind, value)),
+            },
+        ),
+    }
+}
+
+fn measure_message(
+    schema: Schema,
+    definition: isize,
+    message: Message,
+    depth: isize,
+    limits: Limits,
+    counts: Budget,
+    sizes: Vec[isize],
+) -> Result[isize, Error] {
+    depth_check(depth, limits, 0)?;
+    let slot = sizes.len();
+    sizes.push(0);
+    let mut size = 0;
+    for (number, values) in message.fields {
+        if values.is_empty() {
+            continue;
+        }
+        let field = specification(schema, definition, number).ok_or(
+            failure(ErrorKind::Schema, 0, "typed field is absent from schema"),
+        )?;
+        if !repeated(field.rule) && values.len() != 1 {
+            return Result::Err(
+                failure(ErrorKind::TypeMismatch, 0, "singular field has multiple values"),
+            )
+        }
+        if field.rule == Rule::Packed {
+            charge(counts.fields, limits.max_fields, 0, "field limit exceeded")?;
+            let mut payload = 0;
+            for value in values {
+                charge(counts.values, limits.max_values, 0, "value limit exceeded")?;
+                if !value_matches(field.kind, value) {
+                    return Result::Err(
+                        failure(ErrorKind::TypeMismatch, 0, "value does not match schema kind"),
+                    )
+                }
+                payload = output_size(payload, scalar_size(field.kind, value, limits)?, limits)?;
+            }
+            check_blob(payload, limits)?;
+            size = output_size(size, varint_size((number.to_u64() << 3) | 2), limits)?;
+            size = output_size(size, varint_size(payload.to_u64()), limits)?;
+            size = output_size(size, payload, limits)?;
+        } else {
+            for value in values {
+                charge(counts.values, limits.max_values, 0, "value limit exceeded")?;
+                if !value_matches(field.kind, value) {
+                    return Result::Err(
+                        failure(ErrorKind::TypeMismatch, 0, "value does not match schema kind"),
+                    )
+                }
+                if field.rule == Rule::Implicit && default_value(value) {
+                    continue;
+                }
+                charge(counts.fields, limits.max_fields, 0, "field limit exceeded")?;
+                size = output_size(
+                    size,
+                    varint_size((number.to_u64() << 3) | wire_code(kind_wire(field.kind))),
+                    limits,
+                )?;
+                let payload = match (field.kind, value) {
+                    (Kind::Message(id), Value::Message(child)) => {
+                        let child_size = measure_message(
+                            schema,
+                            id,
+                            child,
+                            depth + 1,
+                            limits,
+                            counts,
+                            sizes,
+                        )?;
+                        check_blob(child_size, limits)?;
+                        output_size(varint_size(child_size.to_u64()), child_size, limits)?
+                    },
+                    _ => scalar_size(field.kind, value, limits)?,
+                };
+                size = output_size(size, payload, limits)?;
+            }
+        }
+    }
+    for field in message.unknown {
+        size = output_size(size, raw_size(field, limits, depth, counts)?, limits)?;
+    }
+    for field in schema.definitions.get(definition).fields.iter() {
+        if field.rule == Rule::Required && !message.has(field.number) {
+            return Result::Err(
+                failure(
+                    ErrorKind::MissingRequired,
+                    0,
+                    "missing required field " + field.number.to_string(),
+                ),
+            )
+        }
+    }
+    sizes[slot] = size;
+    Result::Ok(size)
+}
+
+fn put_scalar(output: Vec[u8], kind: Kind, value: Value) -> () {
+    match value {
+        String(text) => {
+            put_varint(output, text.byte_len().to_u64());
+            for at in 0..text.byte_len() {
+                output.push(text.byte_get(at));
+            }
+        },
+        Bytes(bytes) => {
+            put_varint(output, bytes.len().to_u64());
+            output.extend(bytes);
+        },
+        _ => match kind_wire(kind) {
+            Fixed32 => put_fixed(output, numeric_value(kind, value), 4),
+            Fixed64 => put_fixed(output, numeric_value(kind, value), 8),
+            _ => put_varint(output, numeric_value(kind, value)),
+        },
+    }
+}
+
+fn write_message(
+    schema: Schema,
+    definition: isize,
+    message: Message,
+    output: Vec[u8],
+    sizes: Vec[isize],
+    next: Ref[isize],
+) -> () {
+    next.set(next.get() + 1);
+    for (number, values) in message.fields {
+        if values.is_empty() {
+            continue;
+        }
+        if let Some(field) = specification(schema, definition, number) {
+            if field.rule == Rule::Packed {
+                let mut payload = 0;
+                for value in values {
+                    payload += match kind_wire(field.kind) {
+                        Fixed32 => 4,
+                        Fixed64 => 8,
+                        _ => varint_size(numeric_value(field.kind, value)),
+                    };
+                }
+                put_varint(output, (number.to_u64() << 3) | 2);
+                put_varint(output, payload.to_u64());
+                for value in values {
+                    put_scalar(output, field.kind, value);
+                }
+            } else {
+                for value in values {
+                    if field.rule == Rule::Implicit && default_value(value) {
+                        continue;
+                    }
+                    put_varint(output, (number.to_u64() << 3) | wire_code(kind_wire(field.kind)));
+                    match (field.kind, value) {
+                        (Kind::Message(id), Value::Message(child)) => {
+                            put_varint(output, sizes[next.get()].to_u64());
+                            write_message(schema, id, child, output, sizes, next);
+                        },
+                        _ => put_scalar(output, field.kind, value),
+                    }
+                }
+            }
+        }
+    }
+    for field in message.unknown {
+        output.extend(field.raw);
+    }
+}
+
+impl Schema {
+    pub fn encode(self: Schema, message: Message, limits: Limits) -> Result[Vec[u8], Error] {
+        limits.validate()?;
+        let sizes = Vec::new();
+        let size = measure_message(self, self.root, message, 0, limits, budget(), sizes)?;
+        let output = Vec::with_capacity(size);
+        write_message(self, self.root, message, output, sizes, Ref::new(0));
+        Result::Ok(output)
+    }
+}

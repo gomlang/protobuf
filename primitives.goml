@@ -1,0 +1,164 @@
+package protobuf;
+
+pub fn varint_size(value: u64) -> isize {
+    let mut value = value;
+    let mut size = 1;
+    while value >= 128 {
+        value = value >> 7;
+        size += 1;
+    }
+    size
+}
+
+fn varint_at(input: Slice[u8], start: isize, base: isize, canonical: bool) -> Result[
+    (u64, isize),
+    Error,
+] {
+    let mut value: u64 = 0;
+    for index in 0..10 {
+        if index >= input.len() - start {
+            return Result::Err(
+                failure(ErrorKind::UnexpectedEof, base + input.len(), "truncated varint"),
+            )
+        }
+        let byte = input[start + index];
+        if index == 9 && byte > 1 {
+            return Result::Err(
+                failure(ErrorKind::VarintOverflow, base + start + index, "varint exceeds 64 bits"),
+            )
+        }
+        value = value | ((byte & 127).to_u64() << (index * 7));
+        if byte < 128 {
+            if canonical && varint_size(value) != index + 1 {
+                return Result::Err(
+                    failure(ErrorKind::NonCanonical, base + start, "non-minimal varint"),
+                )
+            }
+            return Result::Ok((value, start + index + 1))
+        }
+    }
+    Result::Err(failure(ErrorKind::VarintOverflow, base + start + 9, "varint exceeds 64 bits"))
+}
+
+pub fn consume_varint(input: Slice[u8], canonical: bool) -> Result[(u64, isize), Error] {
+    varint_at(input, 0, 0, canonical)
+}
+
+fn put_varint(output: Vec[u8], value: u64) -> () {
+    let mut value = value;
+    while value >= 128 {
+        output.push((value.to_u8() & 127) | 128);
+        value = value >> 7;
+    }
+    output.push(value.to_u8());
+}
+
+pub fn encode_varint(value: u64) -> Vec[u8] {
+    let output = Vec::with_capacity(varint_size(value));
+    put_varint(output, value);
+    output
+}
+
+pub fn zigzag32(value: i32) -> u32 {
+    (value.to_u32() << 1) ^ (value >> 31).to_u32()
+}
+
+pub fn zigzag64(value: i64) -> u64 {
+    (value.to_u64() << 1) ^ (value >> 63).to_u64()
+}
+
+pub fn unzigzag32(value: u32) -> i32 {
+    (value >> 1).to_i32() ^ -((value & 1).to_i32())
+}
+
+pub fn unzigzag64(value: u64) -> i64 {
+    (value >> 1).to_i64() ^ -((value & 1).to_i64())
+}
+
+fn fixed_at(input: Slice[u8], start: isize, width: isize, base: isize) -> Result[
+    (u64, isize),
+    Error,
+] {
+    if width > input.len() - start {
+        return Result::Err(
+            failure(ErrorKind::UnexpectedEof, base + input.len(), "truncated fixed-width value"),
+        )
+    }
+    let mut value: u64 = 0;
+    for index in 0..width {
+        value = value | (input[start + index].to_u64() << (index * 8));
+    }
+    Result::Ok((value, start + width))
+}
+
+pub fn consume_fixed32(input: Slice[u8]) -> Result[(u32, isize), Error] {
+    let (value, end) = fixed_at(input, 0, 4, 0)?;
+    Result::Ok((value.to_u32(), end))
+}
+
+pub fn consume_fixed64(input: Slice[u8]) -> Result[(u64, isize), Error] {
+    fixed_at(input, 0, 8, 0)
+}
+
+fn put_fixed(output: Vec[u8], value: u64, width: isize) -> () {
+    for index in 0..width {
+        output.push((value >> (index * 8)).to_u8());
+    }
+}
+
+pub fn encode_fixed32(value: u32) -> Vec[u8] {
+    let output = Vec::with_capacity(4);
+    put_fixed(output, value.to_u64(), 4);
+    output
+}
+
+pub fn encode_fixed64(value: u64) -> Vec[u8] {
+    let output = Vec::with_capacity(8);
+    put_fixed(output, value, 8);
+    output
+}
+
+fn valid_number(number: u32, offset: isize) -> Result[(), Error] {
+    if number == 0 || number > 536870911 {
+        Result::Err(
+            failure(ErrorKind::InvalidField, offset, "field number must be in 1..536870911"),
+        )
+    } else {
+        Result::Ok(())
+    }
+}
+
+fn wire_code(wire: WireType) -> u64 {
+    match wire {
+        Varint => 0,
+        Fixed64 => 1,
+        Bytes => 2,
+        StartGroup => 3,
+        EndGroup => 4,
+        Fixed32 => 5,
+    }
+}
+
+pub fn encode_tag(number: u32, wire: WireType) -> Result[Vec[u8], Error] {
+    valid_number(number, 0)?;
+    Result::Ok(encode_varint((number.to_u64() << 3) | wire_code(wire)))
+}
+
+pub fn consume_tag(input: Slice[u8], canonical: bool) -> Result[(u32, WireType, isize), Error] {
+    let (tag, end) = varint_at(input, 0, 0, canonical)?;
+    if tag >> 3 > 536870911 {
+        return Result::Err(failure(ErrorKind::InvalidField, 0, "field number exceeds 29 bits"))
+    }
+    let number = (tag >> 3).to_u32();
+    valid_number(number, 0)?;
+    let wire = match tag & 7 {
+        0 => WireType::Varint,
+        1 => WireType::Fixed64,
+        2 => WireType::Bytes,
+        3 => WireType::StartGroup,
+        4 => WireType::EndGroup,
+        5 => WireType::Fixed32,
+        _ => return Result::Err(failure(ErrorKind::InvalidWire, 0, "reserved wire type")),
+    };
+    Result::Ok((number, wire, end))
+}

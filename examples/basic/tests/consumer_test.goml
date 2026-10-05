@@ -1,0 +1,80 @@
+package tests;
+
+use ecosystem::protobuf::examples::basic as app;
+use std::testing;
+use std::json;
+use std::fs;
+
+fn member(value: json::Value, name: string) -> json::Value {
+    json::field(value, name).unwrap_or(json::Value::Null)
+}
+
+fn corpus(name: string) -> () {
+    let prefix = if fs::is_dir("examples/basic") {
+        "examples/basic/"
+    } else {
+        ""
+    };
+    let source = testing::expect_ok(
+        fs::read_file_structured(prefix + "tests/data/" + name + ".jsonl"),
+        "read frozen Google vectors",
+    );
+    let mut count = 0;
+    for line in source.split("\n") {
+        if line == "" {
+            continue;
+        }
+        count += 1;
+        let row = testing::expect_ok(json::parse(line), "parse frozen vector");
+        let request = member(row, "request");
+        let result = app::handle(request);
+        if json::as_bool(member(row, "error")).unwrap_or(false) {
+            testing::assert_err(result);
+        } else {
+            let actual = testing::expect_ok(
+                result,
+                "Google-valid vector " + name + " " + count.to_string(),
+            );
+            if json::as_string(member(request, "op")) == Option::Some("wire") {
+                let expected = json::field(row, "raw").unwrap_or(json::Value::Array(Vec::new()));
+                testing::assert_eq(json::encode(member(actual, "raw")), json::encode(expected));
+                testing::assert_eq(
+                    json::encode(member(actual, "hex")),
+                    json::encode(member(request, "hex")),
+                );
+            } else {
+                testing::assert_eq(
+                    json::encode(member(actual, "message")),
+                    json::encode(member(row, "message")),
+                );
+                if json::as_string(member(request, "op")) != Option::Some("encode") {
+                    testing::assert_eq(
+                        json::encode(member(actual, "decoded")),
+                        json::encode(member(row, "message")),
+                    );
+                }
+            }
+        }
+    }
+    testing::assert(count > 0);
+}
+
+#[test]
+fn consumer_roundtrip_uses_public_dependency() -> () {
+    testing::assert_ok(app::exercise());
+}
+
+#[test]
+fn google_protowire_frozen_acceptance_and_exact_unknowns() -> () {
+    corpus("wire");
+}
+
+#[test]
+fn google_dynamicpb_frozen_typed_decoding() -> () {
+    corpus("typed");
+}
+
+#[test]
+fn google_dynamicpb_frozen_independent_construction() -> () {
+    corpus("constructed");
+}

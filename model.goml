@@ -1,0 +1,328 @@
+package protobuf;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    InvalidLimits,
+    UnexpectedEof,
+    VarintOverflow,
+    NonCanonical,
+    InvalidField,
+    InvalidWire,
+    GroupMismatch,
+    InvalidUtf8,
+    Limit,
+    Schema,
+    TypeMismatch,
+    MissingRequired,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Error {
+    pub kind: ErrorKind,
+    pub offset: isize,
+    pub message: string,
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        f"byte {self.offset}: {self.message}"
+    }
+}
+
+fn failure(kind: ErrorKind, offset: isize, message: string) -> Error {
+    Error { kind, offset, message }
+}
+
+pub struct Limits {
+    pub max_input: isize,
+    pub max_output: isize,
+    pub max_blob: isize,
+    pub max_fields: isize,
+    pub max_values: isize,
+    pub max_depth: isize,
+    pub max_schema_fields: isize,
+}
+
+impl Limits {
+    pub fn standard() -> Limits {
+        Limits {
+            max_input: 16777216,
+            max_output: 16777216,
+            max_blob: 16777216,
+            max_fields: 1000000,
+            max_values: 1000000,
+            max_depth: 64,
+            max_schema_fields: 16384,
+        }
+    }
+
+    fn validate(self: Limits) -> Result[(), Error] {
+        if self.max_input < 0 || self.max_output < 0 || self.max_blob < 0 || self.max_fields < 0
+            || self.max_values < 0
+            || self.max_depth < 0
+            || self.max_depth > 256
+            || self.max_schema_fields < 0 {
+            Result::Err(
+                failure(
+                    ErrorKind::InvalidLimits,
+                    0,
+                    "limits must be nonnegative; depth must not exceed 256",
+                ),
+            )
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+pub struct Options {
+    pub limits: Limits,
+    pub canonical_varints: bool,
+    pub discard_unknown: bool,
+}
+
+impl Options {
+    pub fn standard() -> Options {
+        Options { limits: Limits::standard(), canonical_varints: false, discard_unknown: false }
+    }
+}
+
+struct Budget {
+    fields: Ref[isize],
+    values: Ref[isize],
+}
+
+fn budget() -> Budget {
+    Budget { fields: Ref::new(0), values: Ref::new(0) }
+}
+
+fn charge(counter: Ref[isize], maximum: isize, offset: isize, resource: string) -> Result[(), Error] {
+    if counter.get() >= maximum {
+        Result::Err(failure(ErrorKind::Limit, offset, resource))
+    } else {
+        counter.set(counter.get() + 1);
+        Result::Ok(())
+    }
+}
+
+fn depth_check(depth: isize, limits: Limits, offset: isize) -> Result[(), Error] {
+    if depth > limits.max_depth {
+        Result::Err(failure(ErrorKind::Limit, offset, "recursion depth limit exceeded"))
+    } else {
+        Result::Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WireType {
+    Varint,
+    Fixed64,
+    Bytes,
+    StartGroup,
+    EndGroup,
+    Fixed32,
+}
+
+pub enum WireValue {
+    Varint(u64),
+    Fixed64(u64),
+    Bytes(Vec[u8]),
+    Group(Vec[RawField]),
+    Fixed32(u32),
+}
+
+pub struct RawField {
+    number: u32,
+    wire: WireType,
+    raw: Vec[u8],
+    payload_start: isize,
+    payload_end: isize,
+    numeric: u64,
+}
+
+impl RawField {
+    pub fn number(self: RawField) -> u32 {
+        self.number
+    }
+
+    pub fn wire_type(self: RawField) -> WireType {
+        self.wire
+    }
+
+    pub fn encoded(self: RawField) -> Vec[u8] {
+        self.raw.copy()
+    }
+
+    pub fn payload(self: RawField) -> Vec[u8] {
+        let output = Vec::with_capacity(self.payload_end - self.payload_start);
+        for at in self.payload_start..self.payload_end {
+            output.push(self.raw[at]);
+        }
+        output
+    }
+
+    pub fn varint(self: RawField) -> Option[u64] {
+        if self.wire == WireType::Varint {
+            Option::Some(self.numeric)
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn fixed32(self: RawField) -> Option[u32] {
+        if self.wire == WireType::Fixed32 {
+            Option::Some(self.numeric.to_u32())
+        } else {
+            Option::None
+        }
+    }
+
+    pub fn fixed64(self: RawField) -> Option[u64] {
+        if self.wire == WireType::Fixed64 {
+            Option::Some(self.numeric)
+        } else {
+            Option::None
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Kind {
+    Double,
+    Float,
+    Int32,
+    Int64,
+    Uint32,
+    Uint64,
+    Sint32,
+    Sint64,
+    Fixed32,
+    Fixed64,
+    Sfixed32,
+    Sfixed64,
+    Bool,
+    String,
+    Bytes,
+    Enum,
+    Message(isize),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Rule {
+    Optional,
+    Implicit,
+    Required,
+    Repeated,
+    Packed,
+}
+
+pub struct FieldSpec {
+    pub number: u32,
+    pub kind: Kind,
+    pub rule: Rule,
+}
+
+pub struct MessageSpec {
+    pub fields: Vec[FieldSpec],
+}
+
+struct Definition {
+    fields: FrozenVec[FieldSpec],
+}
+
+pub struct Schema {
+    definitions: FrozenVec[Definition],
+    root: isize,
+}
+
+pub enum Value {
+    I32(i32),
+    I64(i64),
+    U32(u32),
+    U64(u64),
+    F32(f32),
+    F64(f64),
+    Bool(bool),
+    String(string),
+    Bytes(Vec[u8]),
+    Message(Message),
+}
+
+pub struct Message {
+    fields: Vec[(u32, Vec[Value])],
+    unknown: Vec[RawField],
+}
+
+impl Message {
+    pub fn new() -> Message {
+        Message { fields: Vec::new(), unknown: Vec::new() }
+    }
+
+    pub fn has(self: Message, number: u32) -> bool {
+        for (key, values) in self.fields {
+            if key == number {
+                return !values.is_empty()
+            }
+        }
+        false
+    }
+
+    pub fn get(self: Message, number: u32) -> Option[Value] {
+        for (key, values) in self.fields {
+            if key == number && !values.is_empty() {
+                return Option::Some(values[0])
+            }
+        }
+        Option::None
+    }
+
+    pub fn get_all(self: Message, number: u32) -> Vec[Value] {
+        for (key, values) in self.fields {
+            if key == number {
+                return values.copy()
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn set(self: Message, number: u32, value: Value) -> () {
+        for at in 0..self.fields.len() {
+            if self.fields[at].0 == number {
+                self.fields[at] = (number, Vec::from_array([value]));
+                return
+            }
+        }
+        self.fields.push((number, Vec::from_array([value])));
+    }
+
+    pub fn add(self: Message, number: u32, value: Value) -> () {
+        for (key, values) in self.fields {
+            if key == number {
+                values.push(value);
+                return
+            }
+        }
+        self.fields.push((number, Vec::from_array([value])));
+    }
+
+    pub fn clear(self: Message, number: u32) -> () {
+        for at in 0..self.fields.len() {
+            if self.fields[at].0 == number {
+                self.fields[at].1.clear();
+                return
+            }
+        }
+    }
+
+    pub fn unknown_fields(self: Message) -> Vec[RawField] {
+        self.unknown.copy()
+    }
+
+    pub fn add_unknown(self: Message, field: RawField) -> () {
+        self.unknown.push(field);
+    }
+
+    pub fn clear_unknown(self: Message) -> () {
+        self.unknown.clear();
+    }
+}
