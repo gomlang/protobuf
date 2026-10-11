@@ -1,11 +1,13 @@
 # protobuf
 
-A bounded Protocol Buffers wire codec and explicit schema runtime for GoML 0.1.57 or newer. Production code is pure GoML, with no native or ecosystem dependencies. Google Go protobuf is a development-only compatibility oracle.
+A bounded Protocol Buffers wire codec and explicit schema runtime for the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). Production code is pure GoML, with no native or ecosystem dependencies. Google Go protobuf is a development-only compatibility oracle.
 
 ```toml
 [dependencies]
-"ecosystem::protobuf" = "0.1.0"
+"ecosystem::protobuf" = true
 ```
+
+GoML dependencies are unversioned: `true` tracks each package repository’s default branch.
 
 ```goml
 use ecosystem::protobuf as pb;
@@ -114,7 +116,6 @@ Two differences are explicitly tested: this library rejects field numbers above 
 ```sh
 goml fmt --check
 goml test
-goml verify
 # GOML_VERIFY_DRIVER is preferred; GOML is the fallback, then PATH.
 cd tools/oracle
 GOML_VERIFY_DRIVER=/path/to/goml go test -count=1 ./...
@@ -123,4 +124,4 @@ GOML_VERIFY_DRIVER=/path/to/goml GOFLAGS=-race go test -race -count=1 ./...
 GOML_VERIFY_DRIVER=/path/to/goml PROTOBUF_UPDATE_VECTORS=1 go test -count=1 ./...
 ```
 
-The verification runner supplies `GOML_VERIFY_DRIVER` and an isolated `GOML_HOME`; oracle child builds inherit both and `GOFLAGS`, so the race run instruments the GoML consumer too. The Go reference module requires Go 1.24 or newer; CI uses the ecosystem's Go toolchain and retains the pinned GoML 0.1.57 contract.
+The verification runner supplies `GOML_VERIFY_DRIVER` and an isolated `GOML_HOME`; oracle child builds inherit both and `GOFLAGS`, so the race run instruments the GoML consumer too. The Go reference module requires Go 1.24 or newer; CI uses the ecosystem's Go toolchain and the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json).
