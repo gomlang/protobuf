@@ -1,6 +1,6 @@
 # protobuf
 
-A bounded Protocol Buffers wire codec and explicit schema runtime for the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json). Production code is pure GoML, with no native or ecosystem dependencies. Google Go protobuf is a development-only compatibility oracle.
+A bounded Protocol Buffers wire codec and explicit schema runtime for the source-built GoML toolchain with unversioned registry support pinned in [workflows/ci/toolchain.json](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json). Production code is pure GoML, with no native or ecosystem dependencies. Google Go protobuf is a development-only compatibility oracle.
 
 ```toml
 [dependencies]
@@ -124,4 +124,4 @@ GOML_VERIFY_DRIVER=/path/to/goml GOFLAGS=-race go test -race -count=1 ./...
 GOML_VERIFY_DRIVER=/path/to/goml PROTOBUF_UPDATE_VECTORS=1 go test -count=1 ./...
 ```
 
-The verification runner supplies `GOML_VERIFY_DRIVER` and an isolated `GOML_HOME`; oracle child builds inherit both and `GOFLAGS`, so the race run instruments the GoML consumer too. The Go reference module requires Go 1.24 or newer; CI uses the ecosystem's Go toolchain and the source-built GoML toolchain with unversioned registry support pinned in [verification/ci/toolchain.json](https://github.com/gomlang/verification/blob/main/ci/toolchain.json).
+The verification runner supplies `GOML_VERIFY_DRIVER` and an isolated `GOML_HOME`; oracle child builds inherit both and `GOFLAGS`, so the race run instruments the GoML consumer too. The Go reference module requires Go 1.24 or newer; CI uses the ecosystem's Go toolchain and the source-built GoML toolchain with unversioned registry support pinned in [workflows/ci/toolchain.json](https://github.com/gomlang/workflows/blob/main/ci/toolchain.json).
